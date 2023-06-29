@@ -282,26 +282,34 @@ async function addHandlers({
   connection.onNotification(
     DidOpenTextDocumentNotification.type,
     async params => {
-      const diagnostics =
-        await messageProcessor.handleDidOpenOrSaveNotification(params);
-      reportDiagnostics(diagnostics, connection);
+      const diagnosticsArr = await messageProcessor.waitAndProcessDiagnostics(
+        () => messageProcessor.handleDidOpenOrSaveNotification(params),
+      );
+      for (const diagnostics of diagnosticsArr) {
+        reportDiagnostics(diagnostics, connection);
+      }
     },
   );
   connection.onNotification(
     DidSaveTextDocumentNotification.type,
     async params => {
-      const diagnostics =
-        await messageProcessor.handleDidOpenOrSaveNotification(params);
-      reportDiagnostics(diagnostics, connection);
+      const diagnosticsArr = await messageProcessor.waitAndProcessDiagnostics(
+        () => messageProcessor.handleDidOpenOrSaveNotification(params),
+      );
+      for (const diagnostics of diagnosticsArr) {
+        reportDiagnostics(diagnostics, connection);
+      }
     },
   );
   connection.onNotification(
     DidChangeTextDocumentNotification.type,
     async params => {
-      const diagnostics = await messageProcessor.handleDidChangeNotification(
-        params,
+      const diagnosticsArr = await messageProcessor.waitAndProcessDiagnostics(
+        () => messageProcessor.handleDidChangeNotification(params),
       );
-      reportDiagnostics(diagnostics, connection);
+      for (const diagnostics of diagnosticsArr) {
+        reportDiagnostics(diagnostics, connection);
+      }
     },
   );
 
@@ -340,8 +348,16 @@ async function addHandlers({
     messageProcessor.handleHoverRequest(params),
   );
 
-  connection.onNotification(DidChangeWatchedFilesNotification.type, params =>
-    messageProcessor.handleWatchedFilesChangedNotification(params),
+  connection.onNotification(
+    DidChangeWatchedFilesNotification.type,
+    async params => {
+      const diagnosticsArr = await messageProcessor.waitAndProcessDiagnostics(
+        () => messageProcessor.handleWatchedFilesChangedNotification(params),
+      );
+      for (const diagnostics of diagnosticsArr) {
+        reportDiagnostics(diagnostics, connection);
+      }
+    },
   );
 
   connection.onRequest(DocumentSymbolRequest.type, params =>
@@ -352,7 +368,15 @@ async function addHandlers({
     messageProcessor.handleWorkspaceSymbolRequest(params),
   );
 
-  connection.onNotification(DidChangeConfigurationNotification.type, params =>
-    messageProcessor.handleDidChangeConfiguration(params),
+  connection.onNotification(
+    DidChangeConfigurationNotification.type,
+    async params => {
+      const diagnosticsArr = await messageProcessor.waitAndProcessDiagnostics(
+        () => messageProcessor.handleDidChangeConfiguration(params),
+      );
+      for (const diagnostics of diagnosticsArr) {
+        reportDiagnostics(diagnostics, connection);
+      }
+    },
   );
 }

@@ -90,6 +90,8 @@ export class MessageProcessor {
   _graphQLConfig: GraphQLConfig | undefined;
   _languageService!: GraphQLLanguageService;
   _textDocumentCache = new Map<string, CachedDocumentType>();
+  _queuedDocumentsForDiagnostics = new Set<string>();
+  _queuedDocumentsForEmptyDiagnostics = new Set<string>();
   _isInitialized = false;
   _isGraphQLConfigMissing: boolean | null = null;
   _willShutdown = false;
@@ -290,7 +292,7 @@ export class MessageProcessor {
 
   async handleDidOpenOrSaveNotification(
     params: DidSaveTextDocumentParams | DidOpenTextDocumentParams,
-  ): Promise<PublishDiagnosticsParams | null> {
+  ): Promise<void> {
     /**
      * Initialize the LSP server when the first file is opened or saved,
      * so that we can access the user settings for config rootDir, etc
@@ -300,7 +302,7 @@ export class MessageProcessor {
         // don't try to initialize again if we've already tried
         // and the graphql config file or package.json entry isn't even there
         if (this._isGraphQLConfigMissing === true) {
-          return null;
+          return;
         }
         // then initial call to update graphql config
         await this._updateGraphQLConfig();
@@ -320,8 +322,6 @@ export class MessageProcessor {
     }
     const { textDocument } = params;
     const { uri } = textDocument;
-
-    const diagnostics: Diagnostic[] = [];
 
     let contents: CachedContent[] = [];
     const text = 'text' in textDocument && textDocument.text;
@@ -351,33 +351,22 @@ export class MessageProcessor {
       if (hasGraphQLConfigFile || hasPackageGraphQLConfig) {
         this._logger.info('updating graphql config');
         await this._updateGraphQLConfig();
-        return { uri, diagnostics: [] };
+        this._queueEmptyDiagnostics(uri);
       }
-      return null;
+      return;
     }
     if (!this._graphQLCache) {
-      return { uri, diagnostics };
+      this._queueEmptyDiagnostics(uri);
+      return;
     }
+
     try {
       const project = this._graphQLCache.getProjectForFile(uri);
       if (
         this._isInitialized &&
         project?.extensions?.languageService?.enableValidation !== false
       ) {
-        await Promise.all(
-          contents.map(async ({ query, range }) => {
-            const results = await this._languageService.getDiagnostics(
-              query,
-              uri,
-              this._isRelayCompatMode(query),
-            );
-            if (results && results.length > 0) {
-              diagnostics.push(
-                ...processDiagnosticsMessage(results, query, range),
-              );
-            }
-          }),
-        );
+        this._queueDiagnostics(uri);
       }
 
       this._logger.log(
@@ -391,19 +380,17 @@ export class MessageProcessor {
     } catch (err) {
       this._handleConfigError({ err, uri });
     }
-
-    return { uri, diagnostics };
   }
 
   async handleDidChangeNotification(
     params: DidChangeTextDocumentParams,
-  ): Promise<PublishDiagnosticsParams | null> {
+  ): Promise<void> {
     if (
       this._isGraphQLConfigMissing ||
       !this._isInitialized ||
       !this._graphQLCache
     ) {
-      return null;
+      return;
     }
     // For every `textDocument/didChange` event, keep a cache of textDocuments
     // with version information up-to-date, so that the textDocument contents
@@ -432,30 +419,15 @@ export class MessageProcessor {
       const cachedDocument = this._getCachedDocument(uri);
 
       if (!cachedDocument) {
-        return null;
+        return;
       }
 
       await this._updateFragmentDefinition(uri, contents);
       await this._updateObjectTypeDefinition(uri, contents);
 
-      const diagnostics: Diagnostic[] = [];
-
       if (project?.extensions?.languageService?.enableValidation !== false) {
         // Send the diagnostics onChange as well
-        await Promise.all(
-          contents.map(async ({ query, range }) => {
-            const results = await this._languageService.getDiagnostics(
-              query,
-              uri,
-              this._isRelayCompatMode(query),
-            );
-            if (results && results.length > 0) {
-              diagnostics.push(
-                ...processDiagnosticsMessage(results, query, range),
-              );
-            }
-          }),
-        );
+        this._queueDiagnostics(uri);
       }
 
       this._logger.log(
@@ -466,11 +438,9 @@ export class MessageProcessor {
           fileName: uri,
         }),
       );
-
-      return { uri, diagnostics };
     } catch (err) {
       this._handleConfigError({ err, uri });
-      return { uri, diagnostics: [] };
+      this._queueEmptyDiagnostics(uri);
     }
   }
   async handleDidChangeConfiguration(
@@ -633,16 +603,18 @@ export class MessageProcessor {
 
   async handleWatchedFilesChangedNotification(
     params: DidChangeWatchedFilesParams,
-  ): Promise<Array<PublishDiagnosticsParams | undefined> | null> {
+  ): Promise<void> {
     if (
       this._isGraphQLConfigMissing ||
       !this._isInitialized ||
       !this._graphQLCache
     ) {
-      return null;
+      return;
     }
 
-    return Promise.all(
+    const updatedSchemaProjects = new Set<GraphQLProjectConfig>();
+
+    await Promise.all(
       params.changes.map(async (change: FileEvent) => {
         if (
           this._isGraphQLConfigMissing ||
@@ -665,28 +637,17 @@ export class MessageProcessor {
           await this._updateObjectTypeDefinition(uri, contents);
 
           const project = this._graphQLCache.getProjectForFile(uri);
-          await this._updateSchemaIfChanged(project, uri);
+          const updatedSchema = await this._updateSchemaIfChanged(project, uri);
 
-          let diagnostics: Diagnostic[] = [];
+          const projectIsValidated =
+            project?.extensions?.languageService?.enableValidation !== false;
 
-          if (
-            project?.extensions?.languageService?.enableValidation !== false
-          ) {
-            diagnostics = (
-              await Promise.all(
-                contents.map(async ({ query, range }) => {
-                  const results = await this._languageService.getDiagnostics(
-                    query,
-                    uri,
-                    this._isRelayCompatMode(query),
-                  );
-                  if (results && results.length > 0) {
-                    return processDiagnosticsMessage(results, query, range);
-                  }
-                  return [];
-                }),
-              )
-            ).reduce((left, right) => left.concat(right), diagnostics);
+          if (projectIsValidated) {
+            if (updatedSchema) {
+              updatedSchemaProjects.add(project);
+            } else {
+              this._queueDiagnostics(uri);
+            }
           }
 
           this._logger.log(
@@ -697,7 +658,6 @@ export class MessageProcessor {
               fileName: uri,
             }),
           );
-          return { uri, diagnostics };
         }
         if (change.type === FileChangeTypeKind.Deleted) {
           await this._graphQLCache.updateFragmentDefinitionCache(
@@ -713,6 +673,13 @@ export class MessageProcessor {
         }
       }),
     );
+
+    for (const [uri] of this._textDocumentCache.entries()) {
+      const project = this._graphQLCache.getProjectForFile(uri);
+      if (updatedSchemaProjects.has(project)) {
+        this._queueDiagnostics(uri);
+      }
+    }
   }
 
   async handleDefinitionRequest(
@@ -890,6 +857,13 @@ export class MessageProcessor {
     return [];
   }
 
+  async waitAndProcessDiagnostics(
+    f: () => Promise<unknown>,
+  ): Promise<PublishDiagnosticsParams[]> {
+    await f();
+    return this._processDiagnostics();
+  }
+
   _getTextDocuments() {
     return Array.from(this._textDocumentCache);
   }
@@ -956,11 +930,15 @@ export class MessageProcessor {
       const files = await glob(uri);
       if (files && files.length > 0) {
         await Promise.all(
-          files.map(uriPath => this._cacheSchemaFile(uriPath, project)),
+          files.map(uriPath => {
+            this._queueDiagnostics(uriPath);
+            return this._cacheSchemaFile(uriPath, project);
+          }),
         );
       } else {
         try {
           await this._cacheSchemaFile(uri, project);
+          this._queueDiagnostics(uri);
         } catch {
           // this string may be an SDL string even, how do we even evaluate this?
         }
@@ -972,9 +950,10 @@ export class MessageProcessor {
     project: GraphQLProjectConfig,
   ) {
     await Promise.all(
-      Object.keys(pointer).map(async schemaUri =>
-        this._cacheSchemaPath(schemaUri, project),
-      ),
+      Object.keys(pointer).map(async schemaUri => {
+        this._queueDiagnostics(schemaUri);
+        return this._cacheSchemaPath(schemaUri, project);
+      }),
     );
   }
   async _cacheArraySchema(
@@ -1063,6 +1042,8 @@ export class MessageProcessor {
             cachedSchemaDoc.version++,
           );
         }
+
+        this._queueDiagnostics(uri);
       }
     } catch (err) {
       this._logger.error(String(err));
@@ -1100,6 +1081,8 @@ export class MessageProcessor {
           await this._updateObjectTypeDefinition(uri, contents);
           await this._updateFragmentDefinition(uri, contents);
           await this._invalidateCache({ version: 1, uri }, uri, contents);
+
+          this._queueDiagnostics(uri);
         }),
       );
     } catch (err) {
@@ -1143,16 +1126,19 @@ export class MessageProcessor {
   async _updateSchemaIfChanged(
     project: GraphQLProjectConfig,
     uri: Uri,
-  ): Promise<void> {
+  ): Promise<boolean> {
+    const uriFilePath = URI.parse(uri).fsPath;
+    let updatedSchema = false;
     await Promise.all(
       this._unwrapProjectSchema(project).map(async schema => {
         const schemaFilePath = path.resolve(project.dirpath, schema);
-        const uriFilePath = URI.parse(uri).fsPath;
         if (uriFilePath === schemaFilePath) {
           await this._graphQLCache.invalidateSchemaCacheForProject(project);
+          updatedSchema = true;
         }
       }),
     );
+    return updatedSchema;
   }
 
   _unwrapProjectSchema(project: GraphQLProjectConfig): string[] {
@@ -1220,6 +1206,75 @@ export class MessageProcessor {
       version: textDocument.version ?? 0,
       contents,
     });
+  }
+  async _getDiagnostics(
+    uri: string,
+    contents: CachedContent[],
+  ): Promise<Diagnostic[]> {
+    const diagnostics = await Promise.all(
+      contents.map(async ({ query, range }) => {
+        const results = await this._languageService.getDiagnostics(
+          query,
+          uri,
+          this._isRelayCompatMode(query),
+        );
+        if (results && results.length > 0) {
+          return processDiagnosticsMessage(results, query, range);
+        }
+        return [];
+      }),
+    );
+    return diagnostics.flat();
+  }
+
+  async _getDiagnosticsParams(
+    uri: string,
+  ): Promise<PublishDiagnosticsParams | null> {
+    const document = this._getCachedDocument(uri);
+    if (document === null) {
+      return null;
+    }
+
+    const project = this._graphQLCache.getProjectForFile(uri);
+    const projectIsValidated =
+      project?.extensions?.languageService?.enableValidation !== false;
+    if (!projectIsValidated) {
+      return null;
+    }
+
+    const diagnostics = await this._getDiagnostics(uri, document.contents);
+    return { uri, diagnostics };
+  }
+
+  _queueDiagnostics(uri: string) {
+    this._queuedDocumentsForDiagnostics.add(uri);
+  }
+
+  _queueEmptyDiagnostics(uri: string) {
+    this._queuedDocumentsForEmptyDiagnostics.add(uri);
+  }
+
+  async _processDiagnostics(): Promise<PublishDiagnosticsParams[]> {
+    const promises: Array<Promise<PublishDiagnosticsParams | null>> = [];
+    for (const uri of this._queuedDocumentsForDiagnostics) {
+      if (!this._queuedDocumentsForEmptyDiagnostics.has(uri)) {
+        const promise = this._getDiagnosticsParams(uri);
+        promises.push(promise);
+      }
+    }
+
+    const paramsArr = await Promise.all(promises);
+    const filteredParamsArr: PublishDiagnosticsParams[] = [];
+    for (const params of paramsArr) {
+      if (params !== null) {
+        filteredParamsArr.push(params);
+      }
+    }
+
+    this._queuedDocumentsForDiagnostics.clear();
+    this._queuedDocumentsForEmptyDiagnostics.clear();
+
+    return filteredParamsArr;
   }
 }
 
